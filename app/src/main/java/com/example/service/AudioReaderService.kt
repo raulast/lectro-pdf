@@ -14,6 +14,7 @@ import android.speech.tts.UtteranceProgressListener
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import java.util.Locale
 
 class AudioReaderService : Service(), TextToSpeech.OnInitListener {
@@ -22,14 +23,22 @@ class AudioReaderService : Service(), TextToSpeech.OnInitListener {
     private var isTtsReady = false
     private var pendingText: String? = null
     private var lastUtteranceId: String? = null
+    private var currentSpeed: Float = 1.0f
+    private var currentPitch: Float = 1.0f
 
     companion object {
         const val ACTION_START = "ACTION_START"
         const val ACTION_STOP = "ACTION_STOP"
         const val EXTRA_TEXT = "EXTRA_TEXT"
+        const val EXTRA_SPEED = "EXTRA_SPEED"
+        const val EXTRA_PITCH = "EXTRA_PITCH"
         const val CHANNEL_ID = "AudioReaderChannel"
         const val NOTIFICATION_ID = 1
 
+        
+        private val _pageFinishedEvent = kotlinx.coroutines.flow.MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+        val pageFinishedEvent = _pageFinishedEvent.asSharedFlow()
+        
         private val _isServiceRunning = kotlinx.coroutines.flow.MutableStateFlow(false)
         val isServiceRunning: kotlinx.coroutines.flow.StateFlow<Boolean> = _isServiceRunning.asStateFlow()
     }
@@ -45,7 +54,11 @@ class AudioReaderService : Service(), TextToSpeech.OnInitListener {
         when (action) {
             ACTION_START -> {
                 val text = intent.getStringExtra(EXTRA_TEXT) ?: ""
+                currentSpeed = intent.getFloatExtra(EXTRA_SPEED, 1.0f)
+                currentPitch = intent.getFloatExtra(EXTRA_PITCH, 1.0f)
+                
                 startForegroundService(text)
+
                 if (isTtsReady) {
                     speakText(text)
                 } else {
@@ -92,33 +105,43 @@ class AudioReaderService : Service(), TextToSpeech.OnInitListener {
 
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
-            val locale = Locale("es", "ES")
-            tts?.language = locale
-            
-            // Restablecemos el pitch y la velocidad a los valores por defecto
-            // para que motores neuronales de terceros (como Piper) funcionen sin distorsiones
-            tts?.setSpeechRate(1.0f)
-            tts?.setPitch(1.0f)
+            // Intentar usar la voz por defecto que el usuario ha configurado en su sistema
+            val defaultVoice = tts?.defaultVoice
+            if (defaultVoice != null) {
+                tts?.voice = defaultVoice
+            } else {
+                // Fallback seguro a español o idioma por defecto si no hay voz establecida
+                val locale = Locale("es")
+                val result = tts?.setLanguage(locale)
+                if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                    tts?.language = Locale.getDefault()
+                }
+            }
             
             isTtsReady = true
+
             pendingText?.let {
                 speakText(it)
                 pendingText = null
             }
+
             tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) {
                     isPlaying = true
                 }
+
                 override fun onDone(utteranceId: String?) {
                     if (utteranceId == lastUtteranceId) {
                         isPlaying = false
-                        stopSelf()
+                        _pageFinishedEvent.tryEmit(Unit)
                     }
                 }
+
                 @Deprecated("Deprecated in Java")
                 override fun onError(utteranceId: String?) {
                     if (utteranceId == lastUtteranceId) {
                         isPlaying = false
+                        _pageFinishedEvent.tryEmit(Unit)
                     }
                 }
             })
@@ -128,9 +151,10 @@ class AudioReaderService : Service(), TextToSpeech.OnInitListener {
     private fun speakText(text: String) {
         if (tts != null && text.isNotEmpty()) {
             tts?.stop()
+            tts?.setSpeechRate(currentSpeed)
+            tts?.setPitch(currentPitch)
             
             // Dividir el texto en bloques lógicos por puntos, exclamaciones, interrogaciones o saltos de línea
-            // Esto ayuda enormemente a los motores neuronales a procesar la prosodia natural
             val chunks = text.split(Regex("(?<=[.?!:])\\s+|\\n+"))
             
             var chunkIndex = 0
@@ -147,7 +171,7 @@ class AudioReaderService : Service(), TextToSpeech.OnInitListener {
             
             if (chunkIndex == 0) {
                  isPlaying = false
-                 stopSelf()
+                 _pageFinishedEvent.tryEmit(Unit)
             }
         }
     }

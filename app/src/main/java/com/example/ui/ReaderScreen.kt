@@ -1,5 +1,6 @@
 package com.example.ui
 
+import android.content.Context
 import android.content.Intent
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -23,6 +24,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import android.widget.Toast
+import java.util.Locale
 import androidx.core.content.ContextCompat
 import com.example.service.AudioReaderService
 import kotlinx.coroutines.launch
@@ -47,6 +49,12 @@ fun ReaderScreen(
     
     val isPlaying by AudioReaderService.isServiceRunning.collectAsState()
 
+    
+    val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
+    var voiceSpeed by remember { mutableFloatStateOf(prefs.getFloat("voice_speed", 1.0f)) }
+    var voicePitch by remember { mutableFloatStateOf(prefs.getFloat("voice_pitch", 1.0f)) }
+    var showVoiceSettings by remember { mutableStateOf(false) }
+    
     val coroutineScope = rememberCoroutineScope()
 
     LaunchedEffect(pdfId) {
@@ -111,9 +119,11 @@ fun ReaderScreen(
                             Toast.makeText(context, "No se pudo extraer texto de esta página o aún está cargando.", Toast.LENGTH_SHORT).show()
                             return@IconButton
                         }
-                        val intent = Intent(context, AudioReaderService::class.java).apply {
+                                                val intent = Intent(context, AudioReaderService::class.java).apply {
                             action = if (isPlaying) AudioReaderService.ACTION_STOP else AudioReaderService.ACTION_START
                             putExtra(AudioReaderService.EXTRA_TEXT, pageText)
+                            putExtra(AudioReaderService.EXTRA_SPEED, voiceSpeed)
+                            putExtra(AudioReaderService.EXTRA_PITCH, voicePitch)
                         }
                         ContextCompat.startForegroundService(context, intent)
                     }) {
@@ -121,6 +131,9 @@ fun ReaderScreen(
                             if (isPlaying) Icons.Filled.Stop else Icons.Filled.PlayArrow,
                             contentDescription = "Leer en voz alta"
                         )
+                    }
+                                        IconButton(onClick = { showVoiceSettings = true }) {
+                        Icon(Icons.Filled.SettingsVoice, contentDescription = "Configurar Voz")
                     }
                     IconButton(onClick = { viewModel.generateSummaryAndSentiment() }) {
                         Icon(Icons.Filled.AutoAwesome, contentDescription = "IA Analizar")
@@ -211,5 +224,95 @@ fun ReaderScreen(
                 }
             }
         }
+        
+        if (showVoiceSettings) {
+            VoiceSettingsDialog(
+                speed = voiceSpeed,
+                pitch = voicePitch,
+                onDismiss = { showVoiceSettings = false },
+                onValuesChange = { newSpeed, newPitch ->
+                    voiceSpeed = newSpeed
+                    voicePitch = newPitch
+                    prefs.edit()
+                        .putFloat("voice_speed", newSpeed)
+                        .putFloat("voice_pitch", newPitch)
+                        .apply()
+                }
+            )
+        }
     }
 }
+
+@Composable
+fun VoiceSettingsDialog(
+    speed: Float,
+    pitch: Float,
+    onDismiss: () -> Unit,
+    onValuesChange: (Float, Float) -> Unit
+) {
+    var currentSpeed by remember { mutableFloatStateOf(speed) }
+    var currentPitch by remember { mutableFloatStateOf(pitch) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Configuración de Voz") },
+        text = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = "Velocidad de Lectura: ${String.format(Locale.US, "%.1f", currentSpeed)}x",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Slider(
+                    value = currentSpeed,
+                    onValueChange = { currentSpeed = it },
+                    valueRange = 0.5f..2.5f,
+                    steps = 19
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    text = "Tono de Voz (Pitch): ${String.format(Locale.US, "%.1f", currentPitch)}",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Slider(
+                    value = currentPitch,
+                    onValueChange = { currentPitch = it },
+                    valueRange = 0.5f..2.0f,
+                    steps = 14
+                )
+                
+                Spacer(modifier = Modifier.height(24.dp))
+                val context = androidx.compose.ui.platform.LocalContext.current
+                androidx.compose.material3.OutlinedButton(
+                    onClick = {
+                        try {
+                            val intent = android.content.Intent("com.android.settings.TTS_SETTINGS")
+                            intent.flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+                            context.startActivity(intent)
+                        } catch (e: Exception) {
+                            android.widget.Toast.makeText(context, "No se pudieron abrir los ajustes", android.widget.Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    androidx.compose.material3.Text("Abrir Ajustes del Motor (Sherpa/Piper)")
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    onValuesChange(currentSpeed, currentPitch)
+                    onDismiss()
+                }
+            ) {
+                Text("Guardar")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancelar")
+            }
+        }
+    )
+}
+

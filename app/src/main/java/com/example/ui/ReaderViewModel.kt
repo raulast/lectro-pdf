@@ -2,6 +2,7 @@ package com.example.ui
 
 import android.app.Application
 import android.graphics.Bitmap
+import android.content.Intent
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -40,9 +41,23 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
 
     private var renderer: PdfRendererWrapper? = null
 
+    private var isAutoReading = false
+    private var currentSpeed = 1.0f
+    private var currentPitch = 1.0f
+    private val preloadedTexts = mutableMapOf<Int, String>()
+
+
     init {
         val pdfDao = AppDatabase.getDatabase(application).pdfDao()
         repository = PdfRepository(pdfDao)
+        
+        viewModelScope.launch(Dispatchers.Main) {
+            com.example.service.AudioReaderService.pageFinishedEvent.collect {
+                if (isAutoReading) {
+                    advanceAndReadNextPage()
+                }
+            }
+        }
     }
 
     fun loadPdf(id: Int) {
@@ -57,7 +72,116 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+
+    fun toggleAutoRead(speed: Float, pitch: Float) {
+        val context = getApplication<Application>()
+        if (com.example.service.AudioReaderService.isServiceRunning.value) {
+            stopAutoRead()
+        } else {
+            isAutoReading = true
+            currentSpeed = speed
+            currentPitch = pitch
+            readPageAndPreloadNext(_currentPage.value)
+        }
+    }
+
+    private fun stopAutoRead() {
+        isAutoReading = false
+        val context = getApplication<Application>()
+        val intent = Intent(context, com.example.service.AudioReaderService::class.java).apply {
+            action = com.example.service.AudioReaderService.ACTION_STOP
+        }
+        context.startService(intent)
+    }
+
+    private suspend fun extractTextForPage(pageIndex: Int): String {
+        if (preloadedTexts.containsKey(pageIndex)) {
+            return preloadedTexts[pageIndex]!!
+        }
+        val bitmap = renderer?.renderPage(pageIndex, 1200) ?: return ""
+        val text = PdfTextExtractor.extractTextFromBitmap(bitmap)
+        preloadedTexts[pageIndex] = text
+        return text
+    }
+
+    private fun preloadNextPages(startIndex: Int, total: Int) {
+        viewModelScope.launch(Dispatchers.IO) {
+            var p = startIndex
+            var validPagesFound = 0
+            while (p < total && validPagesFound < 2) {
+                if (!preloadedTexts.containsKey(p)) {
+                    val bitmap = renderer?.renderPage(p, 1200)
+                    if (bitmap != null) {
+                        val text = PdfTextExtractor.extractTextFromBitmap(bitmap)
+                        preloadedTexts[p] = text
+                        if (text.isNotBlank()) validPagesFound++
+                    }
+                } else {
+                    if (preloadedTexts[p]!!.isNotBlank()) validPagesFound++
+                }
+                p++
+            }
+            // Limpiar caché antigua para no saturar memoria
+            val keysToRemove = preloadedTexts.keys.filter { it < startIndex - 1 }
+            keysToRemove.forEach { preloadedTexts.remove(it) }
+        }
+    }
+
+    private fun readPageAndPreloadNext(startIndex: Int) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val total = _currentPdf.value?.totalPages ?: 0
+            if (startIndex >= total) {
+                stopAutoRead()
+                return@launch
+            }
+
+            var p = startIndex
+            var text = extractTextForPage(p)
+
+            // Saltar páginas en blanco
+            while (text.isBlank() && p < total - 1) {
+                p++
+                text = extractTextForPage(p)
+            }
+
+            if (text.isBlank()) {
+                stopAutoRead()
+                return@launch
+            }
+
+            // Actualizar estado de UI
+            if (p != _currentPage.value || _pageText.value != text) {
+                _currentPage.value = p
+                _pageText.value = text
+                _pageBitmap.value = renderer?.renderPage(p, 1200)
+                saveProgress()
+            }
+
+            val context = getApplication<Application>()
+            val intent = Intent(context, com.example.service.AudioReaderService::class.java).apply {
+                action = com.example.service.AudioReaderService.ACTION_START
+                putExtra(com.example.service.AudioReaderService.EXTRA_TEXT, text)
+                putExtra(com.example.service.AudioReaderService.EXTRA_SPEED, currentSpeed)
+                putExtra(com.example.service.AudioReaderService.EXTRA_PITCH, currentPitch)
+            }
+            androidx.core.content.ContextCompat.startForegroundService(context, intent)
+
+            preloadNextPages(p + 1, total)
+        }
+    }
+
+    private fun advanceAndReadNextPage() {
+        if (!isAutoReading) return
+        val total = _currentPdf.value?.totalPages ?: 0
+        if (_currentPage.value >= total - 1) {
+            stopAutoRead()
+            return
+        }
+        readPageAndPreloadNext(_currentPage.value + 1)
+    }
+
     fun nextPage() {
+        stopAutoRead()
         if (_currentPdf.value != null && _currentPage.value < _currentPdf.value!!.totalPages - 1) {
             _currentPage.value += 1
             renderCurrentPage()
@@ -66,6 +190,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun previousPage() {
+        stopAutoRead()
         if (_currentPage.value > 0) {
             _currentPage.value -= 1
             renderCurrentPage()
@@ -75,11 +200,17 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
 
     private fun renderCurrentPage() {
         viewModelScope.launch(Dispatchers.IO) {
-            val bitmap = renderer?.renderPage(_currentPage.value, 1200)
+            val p = _currentPage.value
+            val bitmap = renderer?.renderPage(p, 1200)
             _pageBitmap.value = bitmap
             if (bitmap != null) {
-                // Extract text for TTS
-                val text = PdfTextExtractor.extractTextFromBitmap(bitmap)
+                val text = if (preloadedTexts.containsKey(p)) {
+                    preloadedTexts[p]!!
+                } else {
+                    val extracted = PdfTextExtractor.extractTextFromBitmap(bitmap)
+                    preloadedTexts[p] = extracted
+                    extracted
+                }
                 _pageText.value = text
             } else {
                 _pageText.value = ""
@@ -96,7 +227,6 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             }
         }
     }
-    
     fun updatePdfEntity(summary: String, sentiment: String) {
         viewModelScope.launch(Dispatchers.IO) {
             _currentPdf.value?.let { pdf ->
@@ -151,6 +281,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     override fun onCleared() {
+        stopAutoRead()
         super.onCleared()
         renderer?.close()
     }
