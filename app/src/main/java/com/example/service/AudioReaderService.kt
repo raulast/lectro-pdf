@@ -15,6 +15,7 @@ import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.launch
 import java.util.Locale
 
 class AudioReaderService : Service(), TextToSpeech.OnInitListener {
@@ -26,6 +27,7 @@ class AudioReaderService : Service(), TextToSpeech.OnInitListener {
     private var currentSpeed: Float = 1.0f
     private var currentPitch: Float = 1.0f
     private var currentEngine: String? = null
+    private var currentVoiceName: String? = null
 
     companion object {
         const val ACTION_START = "ACTION_START"
@@ -63,7 +65,10 @@ class AudioReaderService : Service(), TextToSpeech.OnInitListener {
                 currentSpeed = intent.getFloatExtra(EXTRA_SPEED, 1.0f)
                 currentPitch = intent.getFloatExtra(EXTRA_PITCH, 1.0f)
                 val requestedEngine = intent.getStringExtra(EXTRA_ENGINE)
+                val requestedVoice = intent.getStringExtra(EXTRA_VOICE_NAME)
                 val startIndex = intent.getIntExtra(EXTRA_START_INDEX, 0)
+                
+                currentVoiceName = requestedVoice
 
                 startForegroundService(text)
 
@@ -78,9 +83,17 @@ class AudioReaderService : Service(), TextToSpeech.OnInitListener {
                         TextToSpeech(this, this)
                     }
                     pendingText = text
-                    // No podemos saltar directamente al indice si el TTS no está listo, 
-                    // así que asumimos que empezará de cero o lo guardamos si lo necesitamos
                 } else {
+                    if (!requestedVoice.isNullOrEmpty()) {
+                        try {
+                            val voices = tts?.voices
+                            val selectedVoice = voices?.find { it.name == requestedVoice }
+                            if (selectedVoice != null) {
+                                tts?.language = selectedVoice.locale
+                                tts?.voice = selectedVoice
+                            }
+                        } catch (e: Exception) {}
+                    }
                     if (isTtsReady) {
                         speakText(text, startIndex)
                     } else {
@@ -128,15 +141,30 @@ class AudioReaderService : Service(), TextToSpeech.OnInitListener {
 
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
-            // No forzamos ningún locale específico aquí para evitar que motores de terceros (Sherpa/Piper) fallen.
-            // Usamos la configuración nativa del motor.
-            isTtsReady = true
-
-            pendingText?.let {
-                speakText(it, 0)
-                pendingText = null
+            // Launch coroutine to wait for voices if needed
+            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
+                if (!currentVoiceName.isNullOrEmpty()) {
+                    for (i in 0..15) { // Wait up to 3 seconds for voices to load
+                        val voices = tts?.voices
+                        if (!voices.isNullOrEmpty()) {
+                            val selectedVoice = voices.find { it.name == currentVoiceName }
+                            if (selectedVoice != null) {
+                                tts?.language = selectedVoice.locale
+                                tts?.voice = selectedVoice
+                            }
+                            break
+                        }
+                        kotlinx.coroutines.delay(200)
+                    }
+                }
+                
+                isTtsReady = true
+                pendingText?.let {
+                    speakText(it, 0)
+                    pendingText = null
+                }
             }
-
+            
             tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) {
                     isPlaying = true
@@ -169,6 +197,19 @@ class AudioReaderService : Service(), TextToSpeech.OnInitListener {
     private fun speakText(text: String, startIndex: Int) {
         if (tts != null && text.isNotEmpty()) {
             tts?.stop()
+            
+            // Re-apply voice just before speaking to handle async TTS initialization
+            if (!currentVoiceName.isNullOrEmpty()) {
+                try {
+                    val voices = tts?.voices
+                    val selectedVoice = voices?.find { it.name == currentVoiceName }
+                    if (selectedVoice != null) {
+                        tts?.language = selectedVoice.locale
+                        tts?.voice = selectedVoice
+                    }
+                } catch (e: Exception) {}
+            }
+            
             tts?.setSpeechRate(currentSpeed)
             tts?.setPitch(currentPitch)
             _currentChunkIndex.value = startIndex

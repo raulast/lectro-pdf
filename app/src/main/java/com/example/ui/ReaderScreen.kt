@@ -301,6 +301,12 @@ fun ReaderScreen(
                         .putString("voice_engine", newEngine)
                         .putString("voice_name", newVoice)
                         .apply()
+                        
+                    // Si está leyendo, reiniciar con la nueva configuración
+                    if (com.example.service.AudioReaderService.isServiceRunning.value) {
+                        viewModel.toggleAutoRead(newSpeed, newPitch, newEngine, newVoice) // Stop
+                        viewModel.toggleAutoRead(newSpeed, newPitch, newEngine, newVoice) // Start
+                    }
                 }
             )
         }
@@ -326,28 +332,42 @@ fun VoiceSettingsDialog(
     val context = androidx.compose.ui.platform.LocalContext.current
 
     LaunchedEffect(currentEngine) {
+        var localTts: android.speech.tts.TextToSpeech? = null
+        val latch = kotlinx.coroutines.CompletableDeferred<Boolean>()
+        
+        val initListener = android.speech.tts.TextToSpeech.OnInitListener { status ->
+            latch.complete(status == android.speech.tts.TextToSpeech.SUCCESS)
+        }
+        
+        localTts = if (currentEngine.isNotEmpty()) {
+            android.speech.tts.TextToSpeech(context, initListener, currentEngine)
+        } else {
+            android.speech.tts.TextToSpeech(context, initListener)
+        }
+        
         try {
-            var tempTts: android.speech.tts.TextToSpeech? = null
-            val initListener = android.speech.tts.TextToSpeech.OnInitListener { status ->
-                if (status == android.speech.tts.TextToSpeech.SUCCESS) {
-                    try {
-                        val voices = tempTts?.voices?.toList() ?: emptyList()
-                        // Sort by locale and name
+            val success = kotlinx.coroutines.withTimeoutOrNull(3000) { latch.await() } ?: false
+            if (success) {
+                // Poll for voices since some engines load them asynchronously
+                for (i in 0..15) {
+                    val voices = localTts?.voices?.toList()
+                    if (!voices.isNullOrEmpty()) {
                         availableVoices = voices.sortedBy { it.name }
-                        
-                        // Select default if current voice not found
-                        if (currentVoice.isNotEmpty() && voices.none { it.name == currentVoice }) {
+                        if (currentVoice.isNotEmpty() && availableVoices.none { it.name == currentVoice }) {
                             currentVoice = ""
                         }
-                    } catch (e: Exception) {}
+                        break
+                    }
+                    kotlinx.coroutines.delay(200)
                 }
-            }
-            tempTts = if (currentEngine.isNotEmpty()) {
-                android.speech.tts.TextToSpeech(context, initListener, currentEngine)
             } else {
-                android.speech.tts.TextToSpeech(context, initListener)
+                availableVoices = emptyList()
             }
-        } catch (e: Exception) {}
+        } finally {
+            try {
+                localTts?.shutdown()
+            } catch (e: Exception) {}
+        }
     }
 
     AlertDialog(
@@ -376,6 +396,52 @@ fun VoiceSettingsDialog(
                 }
                 
                 if (availableVoices.isNotEmpty()) {
+                    var selectedLanguage by remember { mutableStateOf("") }
+                    val availableLanguages = remember(availableVoices) { 
+                        availableVoices.map { it.locale.displayName }.distinct().sorted() 
+                    }
+                    val filteredVoices = remember(availableVoices, selectedLanguage) {
+                        if (selectedLanguage.isEmpty()) availableVoices 
+                        else availableVoices.filter { it.locale.displayName == selectedLanguage }
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text("Filtrar por Idioma:", style = MaterialTheme.typography.titleSmall)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    
+                    var langExpanded by remember { mutableStateOf(false) }
+                    Box(modifier = Modifier.fillMaxWidth()) {
+                        androidx.compose.material3.OutlinedButton(
+                            onClick = { langExpanded = true },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(if (selectedLanguage.isEmpty()) "Todos los idiomas" else selectedLanguage)
+                        }
+                        
+                        androidx.compose.material3.DropdownMenu(
+                            expanded = langExpanded,
+                            onDismissRequest = { langExpanded = false },
+                            modifier = Modifier.fillMaxHeight(0.5f)
+                        ) {
+                            androidx.compose.material3.DropdownMenuItem(
+                                text = { Text("Todos los idiomas") },
+                                onClick = { 
+                                    selectedLanguage = ""
+                                    langExpanded = false 
+                                }
+                            )
+                            availableLanguages.forEach { lang ->
+                                androidx.compose.material3.DropdownMenuItem(
+                                    text = { Text(lang) },
+                                    onClick = { 
+                                        selectedLanguage = lang
+                                        langExpanded = false 
+                                    }
+                                )
+                            }
+                        }
+                    }
+
                     Spacer(modifier = Modifier.height(16.dp))
                     Text("Voz Específica:", style = MaterialTheme.typography.titleSmall)
                     Spacer(modifier = Modifier.height(8.dp))
@@ -402,7 +468,7 @@ fun VoiceSettingsDialog(
                                     expanded = false 
                                 }
                             )
-                            availableVoices.forEach { v ->
+                            filteredVoices.forEach { v ->
                                 androidx.compose.material3.DropdownMenuItem(
                                     text = { 
                                         Column {
