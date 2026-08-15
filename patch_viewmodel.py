@@ -3,22 +3,10 @@ import re
 with open("app/src/main/java/com/example/ui/ReaderViewModel.kt", "r") as f:
     content = f.read()
 
-# 1. Imports
-if "android.content.Intent" not in content:
-    content = content.replace("import android.net.Uri", "import android.content.Intent\nimport android.net.Uri")
+# Add currentChunkIndex state flow
+content = content.replace("    private val preloadedTexts = mutableMapOf<Int, String>()", "    private val preloadedTexts = mutableMapOf<Int, String>()\n\n    val currentChunkIndex = com.example.service.AudioReaderService.currentChunkIndex\n    var lastKnownChunkIndex = 0")
 
-# 2. State variables
-state_vars = """    private var renderer: PdfRendererWrapper? = null
-
-    private var isAutoReading = false
-    private var currentSpeed = 1.0f
-    private var currentPitch = 1.0f
-    private val preloadedTexts = mutableMapOf<Int, String>()
-"""
-content = content.replace("    private var renderer: PdfRendererWrapper? = null", state_vars)
-
-# 3. Init block (collect events)
-init_block = """    init {
+init_block_replacement = """    init {
         val pdfDao = AppDatabase.getDatabase(application).pdfDao()
         repository = PdfRepository(pdfDao)
         
@@ -29,12 +17,15 @@ init_block = """    init {
                 }
             }
         }
+        viewModelScope.launch(Dispatchers.Main) {
+            currentChunkIndex.collect { idx ->
+                if (idx >= 0) lastKnownChunkIndex = idx
+            }
+        }
     }"""
-content = re.sub(r"    init \{.*?\}", init_block, content, flags=re.DOTALL)
+content = re.sub(r"    init \{.*?\}", init_block_replacement, content, flags=re.DOTALL)
 
-# 4. New methods
-new_methods = """
-    fun toggleAutoRead(speed: Float, pitch: Float) {
+old_toggle = """    fun toggleAutoRead(speed: Float, pitch: Float, engine: String) {
         val context = getApplication<Application>()
         if (com.example.service.AudioReaderService.isServiceRunning.value) {
             stopAutoRead()
@@ -42,96 +33,55 @@ new_methods = """
             isAutoReading = true
             currentSpeed = speed
             currentPitch = pitch
+            currentEngine = engine
             readPageAndPreloadNext(_currentPage.value)
         }
-    }
-
-    private fun stopAutoRead() {
-        isAutoReading = false
+    }"""
+new_toggle = """    fun toggleAutoRead(speed: Float, pitch: Float, engine: String) {
         val context = getApplication<Application>()
-        val intent = Intent(context, com.example.service.AudioReaderService::class.java).apply {
-            action = com.example.service.AudioReaderService.ACTION_STOP
-        }
-        context.startService(intent)
-    }
-
-    private suspend fun extractTextForPage(pageIndex: Int): String {
-        if (preloadedTexts.containsKey(pageIndex)) {
-            return preloadedTexts[pageIndex]!!
-        }
-        val bitmap = renderer?.renderPage(pageIndex, 1200) ?: return ""
-        val text = PdfTextExtractor.extractTextFromBitmap(bitmap)
-        preloadedTexts[pageIndex] = text
-        return text
-    }
-
-    private fun preloadNextPages(startIndex: Int, total: Int) {
-        viewModelScope.launch(Dispatchers.IO) {
-            var p = startIndex
-            var validPagesFound = 0
-            while (p < total && validPagesFound < 2) {
-                if (!preloadedTexts.containsKey(p)) {
-                    val bitmap = renderer?.renderPage(p, 1200)
-                    if (bitmap != null) {
-                        val text = PdfTextExtractor.extractTextFromBitmap(bitmap)
-                        preloadedTexts[p] = text
-                        if (text.isNotBlank()) validPagesFound++
-                    }
-                } else {
-                    if (preloadedTexts[p]!!.isNotBlank()) validPagesFound++
-                }
-                p++
-            }
-            // Limpiar caché antigua para no saturar memoria
-            val keysToRemove = preloadedTexts.keys.filter { it < startIndex - 1 }
-            keysToRemove.forEach { preloadedTexts.remove(it) }
+        if (com.example.service.AudioReaderService.isServiceRunning.value) {
+            stopAutoRead()
+        } else {
+            isAutoReading = true
+            currentSpeed = speed
+            currentPitch = pitch
+            currentEngine = engine
+            readPageAndPreloadNext(_currentPage.value, lastKnownChunkIndex)
         }
     }
+    
+    fun seekToChunk(chunkIndex: Int) {
+        lastKnownChunkIndex = chunkIndex
+        if (!isAutoReading && !com.example.service.AudioReaderService.isServiceRunning.value) {
+            isAutoReading = true
+        }
+        readPageAndPreloadNext(_currentPage.value, chunkIndex)
+    }"""
+content = content.replace(old_toggle, new_toggle)
 
-    private fun readPageAndPreloadNext(startIndex: Int) {
-        viewModelScope.launch(Dispatchers.IO) {
-            val total = _currentPdf.value?.totalPages ?: 0
-            if (startIndex >= total) {
-                stopAutoRead()
-                return@launch
-            }
+# Update readPageAndPreloadNext
+read_page = """    private fun readPageAndPreloadNext(startIndex: Int) {"""
+new_read_page = """    private fun readPageAndPreloadNext(startIndex: Int, startChunkIndex: Int = 0) {"""
+content = content.replace(read_page, new_read_page)
 
-            var p = startIndex
-            var text = extractTextForPage(p)
-
-            // Saltar páginas en blanco
-            while (text.isBlank() && p < total - 1) {
-                p++
-                text = extractTextForPage(p)
-            }
-
-            if (text.isBlank()) {
-                stopAutoRead()
-                return@launch
-            }
-
-            // Actualizar estado de UI
-            if (p != _currentPage.value || _pageText.value != text) {
-                _currentPage.value = p
-                _pageText.value = text
-                _pageBitmap.value = renderer?.renderPage(p, 1200)
-                saveProgress()
-            }
-
-            val context = getApplication<Application>()
-            val intent = Intent(context, com.example.service.AudioReaderService::class.java).apply {
-                action = com.example.service.AudioReaderService.ACTION_START
+# Put startChunkIndex in Intent
+intent_str = """                action = com.example.service.AudioReaderService.ACTION_START
                 putExtra(com.example.service.AudioReaderService.EXTRA_TEXT, text)
                 putExtra(com.example.service.AudioReaderService.EXTRA_SPEED, currentSpeed)
                 putExtra(com.example.service.AudioReaderService.EXTRA_PITCH, currentPitch)
-            }
-            androidx.core.content.ContextCompat.startForegroundService(context, intent)
+                putExtra(com.example.service.AudioReaderService.EXTRA_ENGINE, currentEngine)
+            }"""
+new_intent_str = """                action = com.example.service.AudioReaderService.ACTION_START
+                putExtra(com.example.service.AudioReaderService.EXTRA_TEXT, text)
+                putExtra(com.example.service.AudioReaderService.EXTRA_SPEED, currentSpeed)
+                putExtra(com.example.service.AudioReaderService.EXTRA_PITCH, currentPitch)
+                putExtra(com.example.service.AudioReaderService.EXTRA_ENGINE, currentEngine)
+                putExtra(com.example.service.AudioReaderService.EXTRA_START_INDEX, startChunkIndex)
+            }"""
+content = content.replace(intent_str, new_intent_str)
 
-            preloadNextPages(p + 1, total)
-        }
-    }
-
-    private fun advanceAndReadNextPage() {
+# advanceAndReadNextPage should reset chunk
+advance_page = """    private fun advanceAndReadNextPage() {
         if (!isAutoReading) return
         val total = _currentPdf.value?.totalPages ?: 0
         if (_currentPage.value >= total - 1) {
@@ -139,37 +89,22 @@ new_methods = """
             return
         }
         readPageAndPreloadNext(_currentPage.value + 1)
-    }
-"""
-
-content = content.replace("    fun nextPage() {", new_methods + "\n    fun nextPage() {")
-
-# 5. Modify renderCurrentPage
-render_block = """    private fun renderCurrentPage() {
-        viewModelScope.launch(Dispatchers.IO) {
-            val p = _currentPage.value
-            val bitmap = renderer?.renderPage(p, 1200)
-            _pageBitmap.value = bitmap
-            if (bitmap != null) {
-                val text = if (preloadedTexts.containsKey(p)) {
-                    preloadedTexts[p]!!
-                } else {
-                    val extracted = PdfTextExtractor.extractTextFromBitmap(bitmap)
-                    preloadedTexts[p] = extracted
-                    extracted
-                }
-                _pageText.value = text
-            } else {
-                _pageText.value = ""
-            }
-        }
     }"""
-content = re.sub(r"    private fun renderCurrentPage\(\) \{.*?\}\s*\}", render_block, content, flags=re.DOTALL)
+new_advance_page = """    private fun advanceAndReadNextPage() {
+        if (!isAutoReading) return
+        val total = _currentPdf.value?.totalPages ?: 0
+        if (_currentPage.value >= total - 1) {
+            stopAutoRead()
+            return
+        }
+        lastKnownChunkIndex = 0
+        readPageAndPreloadNext(_currentPage.value + 1, 0)
+    }"""
+content = content.replace(advance_page, new_advance_page)
 
-# 6. Stop auto read on manual navigation
-content = content.replace("    fun nextPage() {\n        if", "    fun nextPage() {\n        stopAutoRead()\n        if")
-content = content.replace("    fun previousPage() {\n        if", "    fun previousPage() {\n        stopAutoRead()\n        if")
-content = content.replace("        super.onCleared()\n        renderer?.close()", "        stopAutoRead()\n        super.onCleared()\n        renderer?.close()")
+# manual paging resets chunk
+content = content.replace("    fun nextPage() {\n        stopAutoRead()", "    fun nextPage() {\n        stopAutoRead()\n        lastKnownChunkIndex = 0")
+content = content.replace("    fun previousPage() {\n        stopAutoRead()", "    fun previousPage() {\n        stopAutoRead()\n        lastKnownChunkIndex = 0")
 
 with open("app/src/main/java/com/example/ui/ReaderViewModel.kt", "w") as f:
     f.write(content)

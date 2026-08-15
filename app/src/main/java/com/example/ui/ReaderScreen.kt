@@ -6,6 +6,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -20,6 +21,11 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -53,6 +59,17 @@ fun ReaderScreen(
     val prefs = context.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
     var voiceSpeed by remember { mutableFloatStateOf(prefs.getFloat("voice_speed", 1.0f)) }
     var voicePitch by remember { mutableFloatStateOf(prefs.getFloat("voice_pitch", 1.0f)) }
+    var voiceEngine by remember { mutableStateOf(prefs.getString("voice_engine", "") ?: "") }
+    var voiceName by remember { mutableStateOf(prefs.getString("voice_name", "") ?: "") }
+    
+    var ttsEngines by remember { mutableStateOf<List<android.speech.tts.TextToSpeech.EngineInfo>>(emptyList()) }
+    LaunchedEffect(Unit) {
+        try {
+            val tts = android.speech.tts.TextToSpeech(context) {}
+            ttsEngines = tts.engines ?: emptyList()
+            tts.shutdown()
+        } catch (e: Exception) {}
+    }
     var showVoiceSettings by remember { mutableStateOf(false) }
     
     val coroutineScope = rememberCoroutineScope()
@@ -199,14 +216,54 @@ fun ReaderScreen(
             ) {
                 if (isTextMode) {
                     val scrollState = rememberScrollState()
+                    val chunks = remember(pageText) { com.example.utils.TextChunker.parse(pageText) }
+                    val currentChunkIndex by viewModel.currentChunkIndex.collectAsState(initial = -1)
+                    var textLayoutResult by remember { mutableStateOf<TextLayoutResult?>(null) }
+                    
+                    val annotatedString = buildAnnotatedString {
+                        if (chunks.isEmpty()) {
+                            append(pageText.ifEmpty { "Extrayendo texto..." })
+                        } else {
+                            chunks.forEachIndexed { index, chunk ->
+                                val isRead = isPlaying && index < currentChunkIndex
+                                val isReading = isPlaying && index == currentChunkIndex
+                                val isNext = isPlaying && index == currentChunkIndex + 1
+                    
+                                val textColor = if (isRead) Color.Gray else contentColor
+                                val bgColor = when {
+                                    isReading -> Color(0xFFC8E6C9) // Verde Claro
+                                    isNext -> Color(0xFFFFF9C4) // Amarillo Claro
+                                    else -> Color.Transparent
+                                }
+                    
+                                withStyle(style = SpanStyle(color = textColor, background = bgColor)) {
+                                    append(chunk.text)
+                                }
+                            }
+                        }
+                    }
+
                     Text(
-                        text = pageText.ifEmpty { "Extrayendo texto..." },
+                        text = annotatedString,
                         color = contentColor,
                         fontSize = fontSize,
+                        lineHeight = (fontSize.value * 1.5f).sp,
                         modifier = Modifier
                             .fillMaxSize()
                             .verticalScroll(scrollState)
                             .padding(16.dp)
+                            .pointerInput(chunks, isPlaying, currentChunkIndex) {
+                                detectTapGestures { pos ->
+                                    textLayoutResult?.let { layoutResult ->
+                                        val offset = layoutResult.getOffsetForPosition(pos)
+                                        val clickedChunkIndex = chunks.indexOfFirst { offset >= it.start && offset < it.end }
+                                        if (clickedChunkIndex != -1) {
+                                            viewModel.seekToChunk(clickedChunkIndex)
+                                        }
+                                    }
+                                }
+                            },
+                        onTextLayout = { textLayoutResult = it }
                     )
                 } else {
                     pageBitmap?.let { bmp ->
@@ -229,13 +286,20 @@ fun ReaderScreen(
             VoiceSettingsDialog(
                 speed = voiceSpeed,
                 pitch = voicePitch,
+                engine = voiceEngine,
+                voice = voiceName,
+                enginesList = ttsEngines,
                 onDismiss = { showVoiceSettings = false },
-                onValuesChange = { newSpeed, newPitch ->
+                onValuesChange = { newSpeed, newPitch, newEngine, newVoice ->
                     voiceSpeed = newSpeed
                     voicePitch = newPitch
+                    voiceEngine = newEngine
+                    voiceName = newVoice
                     prefs.edit()
                         .putFloat("voice_speed", newSpeed)
                         .putFloat("voice_pitch", newPitch)
+                        .putString("voice_engine", newEngine)
+                        .putString("voice_name", newVoice)
                         .apply()
                 }
             )
@@ -247,19 +311,118 @@ fun ReaderScreen(
 fun VoiceSettingsDialog(
     speed: Float,
     pitch: Float,
+    engine: String,
+    voice: String,
+    enginesList: List<android.speech.tts.TextToSpeech.EngineInfo>,
     onDismiss: () -> Unit,
-    onValuesChange: (Float, Float) -> Unit
+    onValuesChange: (Float, Float, String, String) -> Unit
 ) {
     var currentSpeed by remember { mutableFloatStateOf(speed) }
     var currentPitch by remember { mutableFloatStateOf(pitch) }
+    var currentEngine by remember { mutableStateOf(engine) }
+    var currentVoice by remember { mutableStateOf(voice) }
+    
+    var availableVoices by remember { mutableStateOf<List<android.speech.tts.Voice>>(emptyList()) }
+    val context = androidx.compose.ui.platform.LocalContext.current
+
+    LaunchedEffect(currentEngine) {
+        try {
+            var tempTts: android.speech.tts.TextToSpeech? = null
+            val initListener = android.speech.tts.TextToSpeech.OnInitListener { status ->
+                if (status == android.speech.tts.TextToSpeech.SUCCESS) {
+                    try {
+                        val voices = tempTts?.voices?.toList() ?: emptyList()
+                        // Sort by locale and name
+                        availableVoices = voices.sortedBy { it.name }
+                        
+                        // Select default if current voice not found
+                        if (currentVoice.isNotEmpty() && voices.none { it.name == currentVoice }) {
+                            currentVoice = ""
+                        }
+                    } catch (e: Exception) {}
+                }
+            }
+            tempTts = if (currentEngine.isNotEmpty()) {
+                android.speech.tts.TextToSpeech(context, initListener, currentEngine)
+            } else {
+                android.speech.tts.TextToSpeech(context, initListener)
+            }
+        } catch (e: Exception) {}
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Configuración de Voz") },
         text = {
-            Column(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Text("Motor de Voz:", style = MaterialTheme.typography.titleSmall)
+                enginesList.forEach { eng ->
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { currentEngine = eng.name }
+                    ) {
+                        androidx.compose.material3.RadioButton(
+                            selected = (currentEngine == eng.name) || (currentEngine.isEmpty() && eng.name.contains("google")),
+                            onClick = { currentEngine = eng.name }
+                        )
+                        Text(eng.label, style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+                
+                if (availableVoices.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text("Voz Específica:", style = MaterialTheme.typography.titleSmall)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    
+                    var expanded by remember { mutableStateOf(false) }
+                    
+                    Box(modifier = Modifier.fillMaxWidth()) {
+                        androidx.compose.material3.OutlinedButton(
+                            onClick = { expanded = true },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(if (currentVoice.isEmpty()) "Por Defecto" else currentVoice)
+                        }
+                        
+                        androidx.compose.material3.DropdownMenu(
+                            expanded = expanded,
+                            onDismissRequest = { expanded = false },
+                            modifier = Modifier.fillMaxHeight(0.5f)
+                        ) {
+                            androidx.compose.material3.DropdownMenuItem(
+                                text = { Text("Por Defecto") },
+                                onClick = { 
+                                    currentVoice = ""
+                                    expanded = false 
+                                }
+                            )
+                            availableVoices.forEach { v ->
+                                androidx.compose.material3.DropdownMenuItem(
+                                    text = { 
+                                        Column {
+                                            Text(v.name, style = MaterialTheme.typography.bodyMedium)
+                                            Text(v.locale.displayName, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                                        }
+                                    },
+                                    onClick = { 
+                                        currentVoice = v.name
+                                        expanded = false 
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
                 Text(
-                    text = "Velocidad de Lectura: ${String.format(Locale.US, "%.1f", currentSpeed)}x",
+                    text = "Velocidad de Lectura: ${String.format(java.util.Locale.US, "%.1f", currentSpeed)}x",
                     style = MaterialTheme.typography.bodyMedium
                 )
                 Slider(
@@ -270,7 +433,7 @@ fun VoiceSettingsDialog(
                 )
                 Spacer(modifier = Modifier.height(16.dp))
                 Text(
-                    text = "Tono de Voz (Pitch): ${String.format(Locale.US, "%.1f", currentPitch)}",
+                    text = "Tono de Voz (Pitch): ${String.format(java.util.Locale.US, "%.1f", currentPitch)}",
                     style = MaterialTheme.typography.bodyMedium
                 )
                 Slider(
@@ -281,7 +444,6 @@ fun VoiceSettingsDialog(
                 )
                 
                 Spacer(modifier = Modifier.height(24.dp))
-                val context = androidx.compose.ui.platform.LocalContext.current
                 androidx.compose.material3.OutlinedButton(
                     onClick = {
                         try {
@@ -294,14 +456,14 @@ fun VoiceSettingsDialog(
                     },
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    androidx.compose.material3.Text("Abrir Ajustes del Motor (Sherpa/Piper)")
+                    androidx.compose.material3.Text("Abrir Ajustes del Motor")
                 }
             }
         },
         confirmButton = {
             TextButton(
                 onClick = {
-                    onValuesChange(currentSpeed, currentPitch)
+                    onValuesChange(currentSpeed, currentPitch, currentEngine, currentVoice)
                     onDismiss()
                 }
             ) {
@@ -315,4 +477,3 @@ fun VoiceSettingsDialog(
         }
     )
 }
-

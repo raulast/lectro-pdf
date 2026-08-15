@@ -44,7 +44,12 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     private var isAutoReading = false
     private var currentSpeed = 1.0f
     private var currentPitch = 1.0f
+    private var currentEngine = ""
+    private var currentVoiceName = ""
     private val preloadedTexts = mutableMapOf<Int, String>()
+
+    val currentChunkIndex = com.example.service.AudioReaderService.currentChunkIndex
+    var lastKnownChunkIndex = 0
 
 
     init {
@@ -56,6 +61,11 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                 if (isAutoReading) {
                     advanceAndReadNextPage()
                 }
+            }
+        }
+        viewModelScope.launch(Dispatchers.Main) {
+            currentChunkIndex.collect { idx ->
+                if (idx >= 0) lastKnownChunkIndex = idx
             }
         }
     }
@@ -73,7 +83,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     }
 
 
-    fun toggleAutoRead(speed: Float, pitch: Float) {
+    fun toggleAutoRead(speed: Float, pitch: Float, engine: String, voiceName: String) {
         val context = getApplication<Application>()
         if (com.example.service.AudioReaderService.isServiceRunning.value) {
             stopAutoRead()
@@ -81,8 +91,18 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             isAutoReading = true
             currentSpeed = speed
             currentPitch = pitch
-            readPageAndPreloadNext(_currentPage.value)
+            currentEngine = engine
+            currentVoiceName = voiceName
+            readPageAndPreloadNext(_currentPage.value, lastKnownChunkIndex)
         }
+    }
+    
+    fun seekToChunk(chunkIndex: Int) {
+        lastKnownChunkIndex = chunkIndex
+        if (!isAutoReading && !com.example.service.AudioReaderService.isServiceRunning.value) {
+            isAutoReading = true
+        }
+        readPageAndPreloadNext(_currentPage.value, chunkIndex)
     }
 
     private fun stopAutoRead() {
@@ -127,7 +147,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    private fun readPageAndPreloadNext(startIndex: Int) {
+    private fun readPageAndPreloadNext(startIndex: Int, startChunkIndex: Int = 0) {
         viewModelScope.launch(Dispatchers.IO) {
             val total = _currentPdf.value?.totalPages ?: 0
             if (startIndex >= total) {
@@ -163,6 +183,9 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                 putExtra(com.example.service.AudioReaderService.EXTRA_TEXT, text)
                 putExtra(com.example.service.AudioReaderService.EXTRA_SPEED, currentSpeed)
                 putExtra(com.example.service.AudioReaderService.EXTRA_PITCH, currentPitch)
+                putExtra(com.example.service.AudioReaderService.EXTRA_ENGINE, currentEngine)
+                putExtra(com.example.service.AudioReaderService.EXTRA_VOICE_NAME, currentVoiceName)
+                putExtra(com.example.service.AudioReaderService.EXTRA_START_INDEX, startChunkIndex)
             }
             androidx.core.content.ContextCompat.startForegroundService(context, intent)
 
@@ -177,11 +200,13 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             stopAutoRead()
             return
         }
-        readPageAndPreloadNext(_currentPage.value + 1)
+        lastKnownChunkIndex = 0
+        readPageAndPreloadNext(_currentPage.value + 1, 0)
     }
 
     fun nextPage() {
         stopAutoRead()
+        lastKnownChunkIndex = 0
         if (_currentPdf.value != null && _currentPage.value < _currentPdf.value!!.totalPages - 1) {
             _currentPage.value += 1
             renderCurrentPage()
@@ -191,6 +216,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
 
     fun previousPage() {
         stopAutoRead()
+        lastKnownChunkIndex = 0
         if (_currentPage.value > 0) {
             _currentPage.value -= 1
             renderCurrentPage()

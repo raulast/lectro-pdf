@@ -25,6 +25,7 @@ class AudioReaderService : Service(), TextToSpeech.OnInitListener {
     private var lastUtteranceId: String? = null
     private var currentSpeed: Float = 1.0f
     private var currentPitch: Float = 1.0f
+    private var currentEngine: String? = null
 
     companion object {
         const val ACTION_START = "ACTION_START"
@@ -32,20 +33,25 @@ class AudioReaderService : Service(), TextToSpeech.OnInitListener {
         const val EXTRA_TEXT = "EXTRA_TEXT"
         const val EXTRA_SPEED = "EXTRA_SPEED"
         const val EXTRA_PITCH = "EXTRA_PITCH"
+        const val EXTRA_ENGINE = "EXTRA_ENGINE"
+        const val EXTRA_VOICE_NAME = "EXTRA_VOICE_NAME"
+        const val EXTRA_START_INDEX = "EXTRA_START_INDEX"
         const val CHANNEL_ID = "AudioReaderChannel"
         const val NOTIFICATION_ID = 1
 
         
-        private val _pageFinishedEvent = kotlinx.coroutines.flow.MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+        private val _pageFinishedEvent = kotlinx.coroutines.flow.MutableSharedFlow<Unit>(extraBufferCapacity = 1, onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST)
         val pageFinishedEvent = _pageFinishedEvent.asSharedFlow()
         
         private val _isServiceRunning = kotlinx.coroutines.flow.MutableStateFlow(false)
         val isServiceRunning: kotlinx.coroutines.flow.StateFlow<Boolean> = _isServiceRunning.asStateFlow()
+
+        val _currentChunkIndex = kotlinx.coroutines.flow.MutableStateFlow(-1)
+        val currentChunkIndex: kotlinx.coroutines.flow.StateFlow<Int> = _currentChunkIndex.asStateFlow()
     }
 
     override fun onCreate() {
         super.onCreate()
-        tts = TextToSpeech(this, this)
         createNotificationChannel()
     }
 
@@ -56,13 +62,30 @@ class AudioReaderService : Service(), TextToSpeech.OnInitListener {
                 val text = intent.getStringExtra(EXTRA_TEXT) ?: ""
                 currentSpeed = intent.getFloatExtra(EXTRA_SPEED, 1.0f)
                 currentPitch = intent.getFloatExtra(EXTRA_PITCH, 1.0f)
-                
+                val requestedEngine = intent.getStringExtra(EXTRA_ENGINE)
+                val startIndex = intent.getIntExtra(EXTRA_START_INDEX, 0)
+
                 startForegroundService(text)
 
-                if (isTtsReady) {
-                    speakText(text)
-                } else {
+                if (tts == null || currentEngine != requestedEngine) {
+                    tts?.stop()
+                    tts?.shutdown()
+                    isTtsReady = false
+                    currentEngine = requestedEngine
+                    tts = if (!requestedEngine.isNullOrEmpty()) {
+                        TextToSpeech(this, this, requestedEngine)
+                    } else {
+                        TextToSpeech(this, this)
+                    }
                     pendingText = text
+                    // No podemos saltar directamente al indice si el TTS no está listo, 
+                    // así que asumimos que empezará de cero o lo guardamos si lo necesitamos
+                } else {
+                    if (isTtsReady) {
+                        speakText(text, startIndex)
+                    } else {
+                        pendingText = text
+                    }
                 }
             }
             ACTION_STOP -> {
@@ -105,71 +128,83 @@ class AudioReaderService : Service(), TextToSpeech.OnInitListener {
 
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
-            // Intentar usar la voz por defecto que el usuario ha configurado en su sistema
-            val defaultVoice = tts?.defaultVoice
-            if (defaultVoice != null) {
-                tts?.voice = defaultVoice
-            } else {
-                // Fallback seguro a español o idioma por defecto si no hay voz establecida
-                val locale = Locale("es")
-                val result = tts?.setLanguage(locale)
-                if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-                    tts?.language = Locale.getDefault()
-                }
-            }
-            
+            // No forzamos ningún locale específico aquí para evitar que motores de terceros (Sherpa/Piper) fallen.
+            // Usamos la configuración nativa del motor.
             isTtsReady = true
 
             pendingText?.let {
-                speakText(it)
+                speakText(it, 0)
                 pendingText = null
             }
 
             tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) {
                     isPlaying = true
+                    if (utteranceId?.startsWith("CHUNK_") == true) {
+                        val idx = utteranceId.substringAfter("CHUNK_").toIntOrNull()
+                        if (idx != null) {
+                            _currentChunkIndex.value = idx
+                        }
+                    }
                 }
-
                 override fun onDone(utteranceId: String?) {
                     if (utteranceId == lastUtteranceId) {
                         isPlaying = false
                         _pageFinishedEvent.tryEmit(Unit)
+                        _currentChunkIndex.value = -1
                     }
                 }
-
                 @Deprecated("Deprecated in Java")
                 override fun onError(utteranceId: String?) {
                     if (utteranceId == lastUtteranceId) {
                         isPlaying = false
                         _pageFinishedEvent.tryEmit(Unit)
+                        _currentChunkIndex.value = -1
                     }
                 }
             })
         }
     }
 
-    private fun speakText(text: String) {
+    private fun speakText(text: String, startIndex: Int) {
         if (tts != null && text.isNotEmpty()) {
             tts?.stop()
             tts?.setSpeechRate(currentSpeed)
             tts?.setPitch(currentPitch)
+            _currentChunkIndex.value = startIndex
+
+            val chunks = com.example.utils.TextChunker.parse(text)
             
-            // Dividir el texto en bloques lógicos por puntos, exclamaciones, interrogaciones o saltos de línea
-            val chunks = text.split(Regex("(?<=[.?!:])\\s+|\\n+"))
+            var lastId: String? = null
+            var queuedCount = 0
             
-            var chunkIndex = 0
-            for (chunk in chunks) {
-                val cleanChunk = chunk.trim()
-                if (cleanChunk.isNotEmpty()) {
-                    val queueMode = if (chunkIndex == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
-                    val currentId = "TTS_ID_${System.currentTimeMillis()}_$chunkIndex"
-                    lastUtteranceId = currentId
-                    tts?.speak(cleanChunk, queueMode, null, currentId)
-                    chunkIndex++
+            for (i in startIndex until chunks.size) {
+                val chunk = chunks[i]
+                if (chunk.isSpeakable) {
+                    val queueMode = if (queuedCount == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+                    val currentId = "CHUNK_$i"
+                    lastId = currentId
+                    tts?.speak(chunk.text.trim(), queueMode, null, currentId)
+                    
+                    // Delay calculation based on punctuation
+                    val t = chunk.text
+                    val delay = when {
+                        t.contains("\n") -> 800L
+                        t.contains(".") || t.contains("!") || t.contains("?") -> 500L
+                        t.contains(";") -> 300L
+                        t.contains(",") -> 150L
+                        else -> 0L
+                    }
+                    if (delay > 0) {
+                        tts?.playSilentUtterance(delay, TextToSpeech.QUEUE_ADD, "SILENCE_$i")
+                    }
+                    queuedCount++
                 }
             }
             
-            if (chunkIndex == 0) {
+            lastUtteranceId = lastId
+
+            if (queuedCount == 0) {
                  isPlaying = false
                  _pageFinishedEvent.tryEmit(Unit)
             }
