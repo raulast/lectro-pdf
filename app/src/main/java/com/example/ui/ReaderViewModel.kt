@@ -1,6 +1,7 @@
 package com.example.ui
 
 import android.app.Application
+import android.content.Context
 import android.graphics.Bitmap
 import android.content.Intent
 import android.net.Uri
@@ -56,6 +57,12 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         val pdfDao = AppDatabase.getDatabase(application).pdfDao()
         repository = PdfRepository(pdfDao)
         
+        val prefs = application.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
+        currentSpeed = prefs.getFloat("voice_speed", 1.0f)
+        currentPitch = prefs.getFloat("voice_pitch", 1.0f)
+        currentEngine = prefs.getString("voice_engine", "") ?: ""
+        currentVoiceName = prefs.getString("voice_name", "") ?: ""
+        
         viewModelScope.launch(Dispatchers.Main) {
             com.example.service.AudioReaderService.pageFinishedEvent.collect {
                 if (isAutoReading) {
@@ -99,6 +106,12 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     
     fun seekToChunk(chunkIndex: Int) {
         lastKnownChunkIndex = chunkIndex
+        val prefs = getApplication<Application>().getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
+        currentSpeed = prefs.getFloat("voice_speed", currentSpeed)
+        currentPitch = prefs.getFloat("voice_pitch", currentPitch)
+        currentEngine = prefs.getString("voice_engine", currentEngine) ?: currentEngine
+        currentVoiceName = prefs.getString("voice_name", currentVoiceName) ?: currentVoiceName
+
         if (!isAutoReading && !com.example.service.AudioReaderService.isServiceRunning.value) {
             isAutoReading = true
         }

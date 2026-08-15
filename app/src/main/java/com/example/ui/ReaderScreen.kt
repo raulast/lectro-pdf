@@ -136,13 +136,7 @@ fun ReaderScreen(
                             Toast.makeText(context, "No se pudo extraer texto de esta página o aún está cargando.", Toast.LENGTH_SHORT).show()
                             return@IconButton
                         }
-                                                val intent = Intent(context, AudioReaderService::class.java).apply {
-                            action = if (isPlaying) AudioReaderService.ACTION_STOP else AudioReaderService.ACTION_START
-                            putExtra(AudioReaderService.EXTRA_TEXT, pageText)
-                            putExtra(AudioReaderService.EXTRA_SPEED, voiceSpeed)
-                            putExtra(AudioReaderService.EXTRA_PITCH, voicePitch)
-                        }
-                        ContextCompat.startForegroundService(context, intent)
+                        viewModel.toggleAutoRead(voiceSpeed, voicePitch, voiceEngine, voiceName)
                     }) {
                         Icon(
                             if (isPlaying) Icons.Filled.Stop else Icons.Filled.PlayArrow,
@@ -328,10 +322,19 @@ fun VoiceSettingsDialog(
     var currentEngine by remember { mutableStateOf(engine) }
     var currentVoice by remember { mutableStateOf(voice) }
     
+    val isGoogleEngine = remember(currentEngine, enginesList) {
+        currentEngine.contains("google", ignoreCase = true) ||
+        (currentEngine.isEmpty() && (enginesList.isEmpty() || enginesList.any { it.name.contains("google", ignoreCase = true) }))
+    }
+
     var availableVoices by remember { mutableStateOf<List<android.speech.tts.Voice>>(emptyList()) }
     val context = androidx.compose.ui.platform.LocalContext.current
 
-    LaunchedEffect(currentEngine) {
+    LaunchedEffect(currentEngine, isGoogleEngine) {
+        if (!isGoogleEngine) {
+            availableVoices = emptyList()
+            return@LaunchedEffect
+        }
         var localTts: android.speech.tts.TextToSpeech? = null
         val latch = kotlinx.coroutines.CompletableDeferred<Boolean>()
         
@@ -381,22 +384,36 @@ fun VoiceSettingsDialog(
             ) {
                 Text("Motor de Voz:", style = MaterialTheme.typography.titleSmall)
                 enginesList.forEach { eng ->
+                    val isSelected = (currentEngine == eng.name) || (currentEngine.isEmpty() && eng.name.contains("google", ignoreCase = true))
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { currentEngine = eng.name }
+                            .clickable { 
+                                currentEngine = eng.name
+                                if (!eng.name.contains("google", ignoreCase = true)) {
+                                    currentVoice = ""
+                                }
+                            }
                     ) {
                         androidx.compose.material3.RadioButton(
-                            selected = (currentEngine == eng.name) || (currentEngine.isEmpty() && eng.name.contains("google")),
-                            onClick = { currentEngine = eng.name }
+                            selected = isSelected,
+                            onClick = { 
+                                currentEngine = eng.name
+                                if (!eng.name.contains("google", ignoreCase = true)) {
+                                    currentVoice = ""
+                                }
+                            }
                         )
                         Text(eng.label, style = MaterialTheme.typography.bodyMedium)
                     }
                 }
                 
-                if (availableVoices.isNotEmpty()) {
-                    var selectedLanguage by remember { mutableStateOf("") }
+                if (isGoogleEngine && availableVoices.isNotEmpty()) {
+                    var selectedLanguage by remember(currentEngine, availableVoices) { 
+                        val matchingVoice = availableVoices.find { it.name == currentVoice }
+                        mutableStateOf(matchingVoice?.locale?.displayName ?: "") 
+                    }
                     val availableLanguages = remember(availableVoices) { 
                         availableVoices.map { it.locale.displayName }.distinct().sorted() 
                     }

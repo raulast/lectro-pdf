@@ -23,6 +23,7 @@ class AudioReaderService : Service(), TextToSpeech.OnInitListener {
     private var isPlaying = false
     private var isTtsReady = false
     private var pendingText: String? = null
+    private var pendingStartIndex: Int = 0
     private var lastUtteranceId: String? = null
     private var currentSpeed: Float = 1.0f
     private var currentPitch: Float = 1.0f
@@ -64,40 +65,39 @@ class AudioReaderService : Service(), TextToSpeech.OnInitListener {
                 val text = intent.getStringExtra(EXTRA_TEXT) ?: ""
                 currentSpeed = intent.getFloatExtra(EXTRA_SPEED, 1.0f)
                 currentPitch = intent.getFloatExtra(EXTRA_PITCH, 1.0f)
-                val requestedEngine = intent.getStringExtra(EXTRA_ENGINE)
-                val requestedVoice = intent.getStringExtra(EXTRA_VOICE_NAME)
+                val requestedEngine = intent.getStringExtra(EXTRA_ENGINE) ?: ""
+                val requestedVoice = intent.getStringExtra(EXTRA_VOICE_NAME) ?: ""
                 val startIndex = intent.getIntExtra(EXTRA_START_INDEX, 0)
                 
                 currentVoiceName = requestedVoice
 
                 startForegroundService(text)
 
-                if (tts == null || currentEngine != requestedEngine) {
-                    tts?.stop()
-                    tts?.shutdown()
+                val engineChanged = (tts == null) || (currentEngine != requestedEngine)
+                if (engineChanged) {
+                    try {
+                        tts?.stop()
+                        tts?.shutdown()
+                    } catch (e: Exception) {}
+                    
+                    tts = null
                     isTtsReady = false
                     currentEngine = requestedEngine
-                    tts = if (!requestedEngine.isNullOrEmpty()) {
+                    pendingText = text
+                    pendingStartIndex = startIndex
+                    
+                    tts = if (requestedEngine.isNotEmpty()) {
                         TextToSpeech(this, this, requestedEngine)
                     } else {
                         TextToSpeech(this, this)
                     }
-                    pendingText = text
                 } else {
-                    if (!requestedVoice.isNullOrEmpty()) {
-                        try {
-                            val voices = tts?.voices
-                            val selectedVoice = voices?.find { it.name == requestedVoice }
-                            if (selectedVoice != null) {
-                                tts?.language = selectedVoice.locale
-                                tts?.voice = selectedVoice
-                            }
-                        } catch (e: Exception) {}
-                    }
+                    applyVoiceAndSettings()
                     if (isTtsReady) {
                         speakText(text, startIndex)
                     } else {
                         pendingText = text
+                        pendingStartIndex = startIndex
                     }
                 }
             }
@@ -141,7 +141,6 @@ class AudioReaderService : Service(), TextToSpeech.OnInitListener {
 
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
-            // Launch coroutine to wait for voices if needed
             kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
                 if (!currentVoiceName.isNullOrEmpty()) {
                     for (i in 0..15) { // Wait up to 3 seconds for voices to load
@@ -149,7 +148,6 @@ class AudioReaderService : Service(), TextToSpeech.OnInitListener {
                         if (!voices.isNullOrEmpty()) {
                             val selectedVoice = voices.find { it.name == currentVoiceName }
                             if (selectedVoice != null) {
-                                tts?.language = selectedVoice.locale
                                 tts?.voice = selectedVoice
                             }
                             break
@@ -160,7 +158,7 @@ class AudioReaderService : Service(), TextToSpeech.OnInitListener {
                 
                 isTtsReady = true
                 pendingText?.let {
-                    speakText(it, 0)
+                    speakText(it, pendingStartIndex)
                     pendingText = null
                 }
             }
@@ -194,24 +192,26 @@ class AudioReaderService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    private fun speakText(text: String, startIndex: Int) {
-        if (tts != null && text.isNotEmpty()) {
-            tts?.stop()
-            
-            // Re-apply voice just before speaking to handle async TTS initialization
+    private fun applyVoiceAndSettings() {
+        tts?.let { engine ->
+            engine.setSpeechRate(currentSpeed)
+            engine.setPitch(currentPitch)
             if (!currentVoiceName.isNullOrEmpty()) {
                 try {
-                    val voices = tts?.voices
+                    val voices = engine.voices
                     val selectedVoice = voices?.find { it.name == currentVoiceName }
                     if (selectedVoice != null) {
-                        tts?.language = selectedVoice.locale
-                        tts?.voice = selectedVoice
+                        engine.voice = selectedVoice
                     }
                 } catch (e: Exception) {}
             }
-            
-            tts?.setSpeechRate(currentSpeed)
-            tts?.setPitch(currentPitch)
+        }
+    }
+
+    private fun speakText(text: String, startIndex: Int) {
+        if (tts != null && text.isNotEmpty()) {
+            tts?.stop()
+            applyVoiceAndSettings()
             _currentChunkIndex.value = startIndex
 
             val chunks = com.example.utils.TextChunker.parse(text)
