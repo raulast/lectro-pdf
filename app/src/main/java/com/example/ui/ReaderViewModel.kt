@@ -14,8 +14,10 @@ import com.example.api.RetrofitClient
 import com.example.data.AppDatabase
 import com.example.data.PdfDocumentEntity
 import com.example.data.PdfRepository
+import com.example.domain.PageSplit
 import com.example.domain.PdfRendererWrapper
 import com.example.domain.PdfTextExtractor
+import com.example.domain.VirtualPage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -27,6 +29,9 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     
     private val _currentPdf = MutableStateFlow<PdfDocumentEntity?>(null)
     val currentPdf: StateFlow<PdfDocumentEntity?> = _currentPdf.asStateFlow()
+
+    private val _virtualPages = MutableStateFlow<List<VirtualPage>>(emptyList())
+    val virtualPages: StateFlow<List<VirtualPage>> = _virtualPages.asStateFlow()
 
     private val _currentPage = MutableStateFlow(0)
     val currentPage: StateFlow<Int> = _currentPage.asStateFlow()
@@ -40,6 +45,12 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     private val _isGeneratingSummary = MutableStateFlow(false)
     val isGeneratingSummary: StateFlow<Boolean> = _isGeneratingSummary.asStateFlow()
 
+    private val _isSplitDoublePages = MutableStateFlow(true)
+    val isSplitDoublePages: StateFlow<Boolean> = _isSplitDoublePages.asStateFlow()
+
+    private val _hasDoublePages = MutableStateFlow(false)
+    val hasDoublePages: StateFlow<Boolean> = _hasDoublePages.asStateFlow()
+
     private var renderer: PdfRendererWrapper? = null
 
     private var isAutoReading = false
@@ -51,7 +62,6 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
 
     val currentChunkIndex = com.example.service.AudioReaderService.currentChunkIndex
     var lastKnownChunkIndex = 0
-
 
     init {
         val pdfDao = AppDatabase.getDatabase(application).pdfDao()
@@ -82,13 +92,68 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             val pdf = repository.getPdfById(id)
             if (pdf != null) {
                 _currentPdf.value = pdf
-                _currentPage.value = pdf.lastReadPage
-                renderer = PdfRendererWrapper(getApplication(), Uri.parse(pdf.uriString))
+                val r = PdfRendererWrapper(getApplication(), Uri.parse(pdf.uriString))
+                renderer = r
+                
+                val hasWide = r.hasAnyWidePages()
+                _hasDoublePages.value = hasWide
+
+                val prefs = getApplication<Application>().getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
+                // Por defecto, si el PDF tiene hojas dobles (2 en 1), se activa la división automáticamente
+                val splitPref = prefs.getBoolean("split_double_pages_${pdf.id}", hasWide)
+                _isSplitDoublePages.value = splitPref
+
+                val pages = r.buildVirtualPages(splitPref)
+                _virtualPages.value = pages
+
+                val resumePage = pdf.lastReadPage.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
+                _currentPage.value = resumePage
+                
+                // Si el total de páginas virtuales difiere de la BD, actualizarlo
+                if (pages.isNotEmpty() && pdf.totalPages != pages.size) {
+                    val updated = pdf.copy(totalPages = pages.size, lastReadPage = resumePage)
+                    repository.updatePdf(updated)
+                    _currentPdf.value = updated
+                }
+
                 renderCurrentPage()
             }
         }
     }
 
+    fun toggleSplitDoublePages() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val pdf = _currentPdf.value ?: return@launch
+            val r = renderer ?: return@launch
+            val currentVIdx = _currentPage.value
+            val currentVP = _virtualPages.value.getOrNull(currentVIdx)
+            val currentPdfIdx = currentVP?.pdfIndex ?: 0
+
+            val newSplit = !_isSplitDoublePages.value
+            _isSplitDoublePages.value = newSplit
+
+            val prefs = getApplication<Application>().getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
+            prefs.edit().putBoolean("split_double_pages_${pdf.id}", newSplit).apply()
+
+            val newPages = r.buildVirtualPages(newSplit)
+            _virtualPages.value = newPages
+
+            // Mapear al nuevo índice de la página correspondiente a la misma hoja
+            val newIdx = newPages.indexOfFirst { it.pdfIndex == currentPdfIdx }.coerceAtLeast(0)
+            _currentPage.value = newIdx
+
+            val updated = pdf.copy(totalPages = newPages.size, lastReadPage = newIdx)
+            repository.updatePdf(updated)
+            _currentPdf.value = updated
+
+            preloadedTexts.clear()
+            renderCurrentPage()
+
+            if (isAutoReading) {
+                readPageAndPreloadNext(newIdx, 0)
+            }
+        }
+    }
 
     fun toggleAutoRead(speed: Float, pitch: Float, engine: String, voiceName: String) {
         val context = getApplication<Application>()
@@ -127,13 +192,17 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         context.startService(intent)
     }
 
-    private suspend fun extractTextForPage(pageIndex: Int): String {
-        if (preloadedTexts.containsKey(pageIndex)) {
-            return preloadedTexts[pageIndex]!!
+    private suspend fun extractTextForPage(vIdx: Int): String {
+        if (preloadedTexts.containsKey(vIdx)) {
+            return preloadedTexts[vIdx]!!
         }
-        val bitmap = renderer?.renderPage(pageIndex, 1200) ?: return ""
+        val pages = _virtualPages.value
+        if (vIdx !in pages.indices) return ""
+        val vp = pages[vIdx]
+        val bitmap = renderer?.renderVirtualPage(vp, 1200) ?: return ""
         val text = PdfTextExtractor.extractTextFromBitmap(bitmap)
-        preloadedTexts[pageIndex] = text
+        bitmap.recycle()
+        preloadedTexts[vIdx] = text
         return text
     }
 
@@ -143,12 +212,8 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             var validPagesFound = 0
             while (p < total && validPagesFound < 2) {
                 if (!preloadedTexts.containsKey(p)) {
-                    val bitmap = renderer?.renderPage(p, 1200)
-                    if (bitmap != null) {
-                        val text = PdfTextExtractor.extractTextFromBitmap(bitmap)
-                        preloadedTexts[p] = text
-                        if (text.isNotBlank()) validPagesFound++
-                    }
+                    val text = extractTextForPage(p)
+                    if (text.isNotBlank()) validPagesFound++
                 } else {
                     if (preloadedTexts[p]!!.isNotBlank()) validPagesFound++
                 }
@@ -162,7 +227,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
 
     private fun readPageAndPreloadNext(startIndex: Int, startChunkIndex: Int = 0) {
         viewModelScope.launch(Dispatchers.IO) {
-            val total = _currentPdf.value?.totalPages ?: 0
+            val total = _virtualPages.value.size
             if (startIndex >= total) {
                 stopAutoRead()
                 return@launch
@@ -186,7 +251,10 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             if (p != _currentPage.value || _pageText.value != text) {
                 _currentPage.value = p
                 _pageText.value = text
-                _pageBitmap.value = renderer?.renderPage(p, 1200)
+                val vp = _virtualPages.value.getOrNull(p)
+                if (vp != null) {
+                    _pageBitmap.value = renderer?.renderVirtualPage(vp, 1200)
+                }
                 saveProgress()
             }
 
@@ -208,7 +276,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
 
     private fun advanceAndReadNextPage() {
         if (!isAutoReading) return
-        val total = _currentPdf.value?.totalPages ?: 0
+        val total = _virtualPages.value.size
         if (_currentPage.value >= total - 1) {
             stopAutoRead()
             return
@@ -220,7 +288,8 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     fun nextPage() {
         stopAutoRead()
         lastKnownChunkIndex = 0
-        if (_currentPdf.value != null && _currentPage.value < _currentPdf.value!!.totalPages - 1) {
+        val total = _virtualPages.value.size
+        if (_currentPage.value < total - 1) {
             _currentPage.value += 1
             renderCurrentPage()
             saveProgress()
@@ -240,7 +309,14 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     private fun renderCurrentPage() {
         viewModelScope.launch(Dispatchers.IO) {
             val p = _currentPage.value
-            val bitmap = renderer?.renderPage(p, 1200)
+            val pages = _virtualPages.value
+            if (p !in pages.indices) {
+                _pageBitmap.value = null
+                _pageText.value = ""
+                return@launch
+            }
+            val vp = pages[p]
+            val bitmap = renderer?.renderVirtualPage(vp, 1200)
             _pageBitmap.value = bitmap
             if (bitmap != null) {
                 val text = if (preloadedTexts.containsKey(p)) {
@@ -266,6 +342,7 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
             }
         }
     }
+
     fun updatePdfEntity(summary: String, sentiment: String) {
         viewModelScope.launch(Dispatchers.IO) {
             _currentPdf.value?.let { pdf ->

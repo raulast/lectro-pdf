@@ -45,13 +45,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             val renderer = PdfRendererWrapper(context, uri)
-            val totalPages = renderer.pageCount
+            val hasWide = renderer.hasAnyWidePages()
+            val virtualPages = renderer.buildVirtualPages(splitDouble = hasWide)
+            val totalPages = virtualPages.size
+            val physicalPages = renderer.pageCount
             
             var finalCoverPath: String? = null
             var detectedTitle = title
             
-            // Analizar las primeras 10 páginas buscando una portada real
-            val pagesToCheck = minOf(10, totalPages)
+            // Analizar las primeras 10 páginas físicas buscando una portada real
+            val pagesToCheck = minOf(10, physicalPages)
             for (i in 0 until pagesToCheck) {
                 val bitmap = renderer.renderPage(i, 800)
                 if (bitmap != null) {
@@ -96,12 +99,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             
             try {
                 val renderer = PdfRendererWrapper(context, uri)
-                val totalPages = renderer.pageCount
+                val hasWide = renderer.hasAnyWidePages()
+                val virtualPages = renderer.buildVirtualPages(splitDouble = hasWide)
+                val totalPages = virtualPages.size
+                val physicalPages = renderer.pageCount
                 
                 var finalCoverPath: String? = null
                 var detectedTitle = pdf.title
                 
-                val pagesToCheck = minOf(10, totalPages)
+                val pagesToCheck = minOf(10, physicalPages)
                 for (i in 0 until pagesToCheck) {
                     val bitmap = renderer.renderPage(i, 800)
                     if (bitmap != null) {
@@ -134,6 +140,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
                 val updatedPdf = pdf.copy(
                     title = detectedTitle,
+                    totalPages = totalPages,
                     coverImagePath = finalCoverPath
                 )
                 repository.updatePdf(updatedPdf)

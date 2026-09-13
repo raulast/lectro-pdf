@@ -47,6 +47,10 @@ fun ReaderScreen(
     val pageBitmap by viewModel.pageBitmap.collectAsState()
     val pageText by viewModel.pageText.collectAsState()
     val isGeneratingSummary by viewModel.isGeneratingSummary.collectAsState()
+    val currentPage by viewModel.currentPage.collectAsState()
+    val virtualPages by viewModel.virtualPages.collectAsState()
+    val isSplitDoublePages by viewModel.isSplitDoublePages.collectAsState()
+    val hasDoublePages by viewModel.hasDoublePages.collectAsState()
 
     var isTextMode by remember { mutableStateOf(false) }
     var isNightMode by remember { mutableStateOf(false) }
@@ -84,13 +88,41 @@ fun ReaderScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(currentPdf?.title ?: "Leyendo") },
+                title = {
+                    Column {
+                        Text(
+                            text = currentPdf?.title ?: "Leyendo",
+                            maxLines = 1,
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                        if (hasDoublePages) {
+                            Text(
+                                text = if (isSplitDoublePages) "2 páginas por hoja (dividido)" else "Hoja completa",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                },
                 navigationIcon = {
                     IconButton(onClick = onNavigateBack) {
                         Icon(Icons.Filled.ArrowBack, contentDescription = "Volver")
                     }
                 },
                 actions = {
+                    if (hasDoublePages) {
+                        IconButton(onClick = {
+                            viewModel.toggleSplitDoublePages()
+                            val msg = if (!isSplitDoublePages) "Modo 2 páginas por hoja activado (páginas divididas)" else "Modo hoja completa activado"
+                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                        }) {
+                            Icon(
+                                if (isSplitDoublePages) Icons.Filled.AutoStories else Icons.Filled.MenuBook,
+                                contentDescription = if (isSplitDoublePages) "Dividir páginas dobles (Activado)" else "Página completa",
+                                tint = if (isSplitDoublePages) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
                     IconButton(onClick = { isNightMode = !isNightMode }) {
                         Icon(
                             if (isNightMode) Icons.Filled.LightMode else Icons.Filled.DarkMode,
@@ -123,9 +155,25 @@ fun ReaderScreen(
                     IconButton(onClick = { viewModel.previousPage() }) {
                         Icon(Icons.Filled.ChevronLeft, contentDescription = "Anterior")
                     }
+
+                    val currentVP = virtualPages.getOrNull(currentPage)
+                    val pageLabel = if (virtualPages.isNotEmpty()) {
+                        val base = "${currentPage + 1} / ${virtualPages.size}"
+                        if (currentVP != null && isSplitDoublePages && (currentVP.split == com.example.domain.PageSplit.LEFT || currentVP.split == com.example.domain.PageSplit.RIGHT)) {
+                            val side = if (currentVP.split == com.example.domain.PageSplit.LEFT) "Izq" else "Der"
+                            "$base ($side)"
+                        } else {
+                            base
+                        }
+                    } else {
+                        "${(currentPdf?.lastReadPage ?: 0) + 1} / ${currentPdf?.totalPages ?: 0}"
+                    }
+
                     Text(
-                        text = "${(currentPdf?.lastReadPage ?: 0) + 1} / ${currentPdf?.totalPages ?: 0}",
-                        modifier = Modifier.padding(horizontal = 16.dp)
+                        text = pageLabel,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(horizontal = 8.dp)
                     )
                     IconButton(onClick = { viewModel.nextPage() }) {
                         Icon(Icons.Filled.ChevronRight, contentDescription = "Siguiente")
