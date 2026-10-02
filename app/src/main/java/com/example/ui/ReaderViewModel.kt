@@ -57,6 +57,9 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     private var currentSpeed = 1.0f
     private var currentPitch = 1.0f
     private var currentEngine = ""
+    private val _bookBookmarks = MutableStateFlow<List<com.example.data.BookmarkEntity>>(emptyList())
+    val bookBookmarks: StateFlow<List<com.example.data.BookmarkEntity>> = _bookBookmarks.asStateFlow()
+
     private var currentVoiceName = ""
     private val preloadedTexts = mutableMapOf<Int, String>()
 
@@ -64,8 +67,8 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
     var lastKnownChunkIndex = 0
 
     init {
-        val pdfDao = AppDatabase.getDatabase(application).pdfDao()
-        repository = PdfRepository(pdfDao)
+        val db = AppDatabase.getDatabase(application)
+        repository = PdfRepository(db.pdfDao(), db.bookmarkDao())
         
         val prefs = application.getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
         currentSpeed = prefs.getFloat("voice_speed", 1.0f)
@@ -87,11 +90,19 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun loadPdf(id: Int) {
+    fun loadPdf(id: Int, targetPage: Int? = null) {
         viewModelScope.launch(Dispatchers.IO) {
             val pdf = repository.getPdfById(id)
             if (pdf != null) {
                 _currentPdf.value = pdf
+
+                // Observe bookmarks for this book
+                launch {
+                    repository.getBookmarksForPdf(id).collect { bms ->
+                        _bookBookmarks.value = bms
+                    }
+                }
+
                 val r = PdfRendererWrapper(getApplication(), Uri.parse(pdf.uriString))
                 renderer = r
                 
@@ -106,18 +117,59 @@ class ReaderViewModel(application: Application) : AndroidViewModel(application) 
                 val pages = r.buildVirtualPages(splitPref)
                 _virtualPages.value = pages
 
-                val resumePage = pdf.lastReadPage.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
-                _currentPage.value = resumePage
+                val pageToOpen = (targetPage ?: pdf.lastReadPage).coerceIn(0, (pages.size - 1).coerceAtLeast(0))
+                _currentPage.value = pageToOpen
                 
                 // Si el total de páginas virtuales difiere de la BD, actualizarlo
                 if (pages.isNotEmpty() && pdf.totalPages != pages.size) {
-                    val updated = pdf.copy(totalPages = pages.size, lastReadPage = resumePage)
+                    val updated = pdf.copy(totalPages = pages.size, lastReadPage = pageToOpen)
                     repository.updatePdf(updated)
                     _currentPdf.value = updated
                 }
 
                 renderCurrentPage()
             }
+        }
+    }
+
+    fun jumpToPage(pageIndex: Int) {
+        stopAutoRead()
+        lastKnownChunkIndex = 0
+        val total = _virtualPages.value.size
+        if (pageIndex in 0 until total) {
+            _currentPage.value = pageIndex
+            renderCurrentPage()
+            saveProgress()
+        }
+    }
+
+    fun addBookmark(title: String, highlightedText: String?, note: String?, color: Int) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val pdf = _currentPdf.value ?: return@launch
+            val pageIdx = _currentPage.value
+            val bookmark = com.example.data.BookmarkEntity(
+                pdfId = pdf.id,
+                bookTitle = pdf.title,
+                pageIndex = pageIdx,
+                pageNumber = pageIdx + 1,
+                title = title.ifBlank { "Pág ${pageIdx + 1}" },
+                highlightedText = highlightedText,
+                note = note,
+                color = color
+            )
+            repository.insertBookmark(bookmark)
+        }
+    }
+
+    fun deleteBookmark(id: Int) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.deleteBookmarkById(id)
+        }
+    }
+
+    fun updateBookmark(bookmark: com.example.data.BookmarkEntity) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.updateBookmark(bookmark)
         }
     }
 

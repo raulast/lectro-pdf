@@ -9,7 +9,7 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface PdfDao {
-    @Query("SELECT * FROM pdfs ORDER BY id DESC")
+    @Query("SELECT * FROM pdfs ORDER BY displayOrder ASC, id DESC")
     fun getAllPdfs(): Flow<List<PdfDocumentEntity>>
 
     @Query("SELECT * FROM pdfs WHERE id = :id")
@@ -20,6 +20,9 @@ interface PdfDao {
 
     @Update
     suspend fun updatePdf(pdf: PdfDocumentEntity)
+
+    @Query("UPDATE pdfs SET displayOrder = :order WHERE id = :id")
+    suspend fun updateDisplayOrder(id: Int, order: Int)
 
     @Query("DELETE FROM pdfs WHERE id = :id")
     suspend fun deletePdfById(id: Int)

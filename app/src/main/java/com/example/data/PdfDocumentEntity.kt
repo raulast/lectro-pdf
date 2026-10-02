@@ -13,5 +13,6 @@ data class PdfDocumentEntity(
     val coverImagePath: String? = null,
     val summary: String? = null,
     val sentiment: String? = null,
-    val coverColor: Int? = null
+    val coverColor: Int? = null,
+    val displayOrder: Int = 0
 )

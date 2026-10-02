@@ -5,13 +5,17 @@ import android.content.Intent
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import android.content.Context
 import com.example.data.AppDatabase
+import com.example.data.BookmarkEntity
 import com.example.data.PdfDocumentEntity
 import com.example.data.PdfRepository
 import com.example.domain.PdfRendererWrapper
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.io.File
@@ -19,15 +23,76 @@ import java.io.File
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val repository: PdfRepository
     val pdfs: StateFlow<List<PdfDocumentEntity>>
+    val allBookmarks: StateFlow<List<BookmarkEntity>>
+
+    private val _viewMode = MutableStateFlow("grid")
+    val viewMode: StateFlow<String> = _viewMode.asStateFlow()
 
     init {
-        val pdfDao = AppDatabase.getDatabase(application).pdfDao()
-        repository = PdfRepository(pdfDao)
+        val db = AppDatabase.getDatabase(application)
+        repository = PdfRepository(db.pdfDao(), db.bookmarkDao())
+        
+        val prefs = application.getSharedPreferences("app_settings", Context.MODE_PRIVATE)
+        _viewMode.value = prefs.getString("view_mode", "grid") ?: "grid"
+
         pdfs = repository.allPdfs.stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(5000),
             initialValue = emptyList()
         )
+
+        allBookmarks = repository.allBookmarks.stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+    }
+
+    fun setViewMode(mode: String) {
+        _viewMode.value = mode
+        val prefs = getApplication<Application>().getSharedPreferences("app_settings", Context.MODE_PRIVATE)
+        prefs.edit().putString("view_mode", mode).apply()
+    }
+
+    fun moveBookUp(pdf: PdfDocumentEntity) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val currentList = pdfs.value
+            val index = currentList.indexOfFirst { it.id == pdf.id }
+            if (index > 0) {
+                val prevPdf = currentList[index - 1]
+                // Normalize and swap display order
+                val newPrevOrder = index
+                val newCurrentOrder = index - 1
+                repository.updatePdfOrder(pdf.id, newCurrentOrder)
+                repository.updatePdfOrder(prevPdf.id, newPrevOrder)
+            }
+        }
+    }
+
+    fun moveBookDown(pdf: PdfDocumentEntity) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val currentList = pdfs.value
+            val index = currentList.indexOfFirst { it.id == pdf.id }
+            if (index != -1 && index < currentList.size - 1) {
+                val nextPdf = currentList[index + 1]
+                val newNextOrder = index
+                val newCurrentOrder = index + 1
+                repository.updatePdfOrder(pdf.id, newCurrentOrder)
+                repository.updatePdfOrder(nextPdf.id, newNextOrder)
+            }
+        }
+    }
+
+    fun deleteBookmark(id: Int) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.deleteBookmarkById(id)
+        }
+    }
+
+    fun updateBookmark(bookmark: BookmarkEntity) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.updateBookmark(bookmark)
+        }
     }
 
     fun addPdf(uri: Uri, title: String) {
